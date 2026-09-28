@@ -30,7 +30,7 @@ AutoBJCE-京网院学习助手 是一个面向 Windows 的干部网络学院课�
 
 ## 最快使用方式（EXE）
 
-1. 打开 `dist/AutoBJCE/AutoBJCE.exe`（窗口标题为 `AutoBJCE-京网院学习助手`）。
+1. 打开 `dist/bjgbwlxysk`（窗口标题为 `AutoBJCE-京网院学习助手`）。
 2. 在界面填写账号、密码，以及本年度期望的必修 / 选修目标学时。
 3. 点击“保存配置”。
 4. 选择用户，点击“开始刷课”。
@@ -71,7 +71,7 @@ GUI 主配置文件，位于程序目录（EXE 同目录）。
 
 建议：
 
-1. 确认使用的是最新 `dist/AutoBJCE/AutoBJCE.exe`。
+1. 确认使用的是最新 `dist/bjgbwlxysk`。
 2. 重新构建 `dist` 后再运行。
 3. 确认系统已安装 Chrome。
 
@@ -121,19 +121,19 @@ python -m PyInstaller build.spec --distpath dist --workpath build_work --noconfi
 
 构建后主程序位于：
 
-- `dist/AutoBJCE/AutoBJCE.exe`
+- `dist/bjgbwlxysk`
 
 ## 使用 Inno Setup 生成安装包
 
 ### 1) 前置条件
 
-- 已完成 EXE 构建，且 `dist/AutoBJCE` 为最新产物。
+- 已完成 EXE 构建，且 `dist/bjgbwlxysk` 为最新产物。
 - 本机已安装 Inno Setup 6。
 
 ### 2) 编译安装脚本
 
 ```bash
-iscc installer/AutoBJCE.iss
+iscc installer/bjgbwlxysk.iss
 ```
 
 默认输出：

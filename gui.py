@@ -6,6 +6,7 @@ import queue
 import json
 import os
 import sys
+import sv_ttk
 
 
 # ── 路径工具（兼容 PyInstaller 打包后的运行环境） ──────────────────────────
@@ -86,7 +87,7 @@ _fix_playwright_driver()
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("AutoBJCE-京网院学习助手")
+        self.title("北京干部网络学院刷课工具")
         self.resizable(False, False)
 
         self._cfg = load_config()
@@ -182,12 +183,12 @@ class App(tk.Tk):
 
         ttk.Button(log_frame, text="清空日志", command=self._clear_log).pack(anchor='e', padx=4, pady=2)
 
-        ttk.Label(
-            self,
-            text="© waynegeng  |  仅供内部学习交流使用，请勿用于商业或违规用途",
-            foreground='gray',
-            anchor='center',
-        ).grid(row=4, column=0, columnspan=2, pady=(0, 6))
+        # ttk.Label(
+        #     self,
+        #     text="© waynegeng  |  仅供内部学习交流使用，请勿用于商业或违规用途",
+        #     foreground='gray',
+        #     anchor='center',
+        # ).grid(row=4, column=0, columnspan=2, pady=(0, 6))
 
     # ── 字段加载 / 保存 ───────────────────────────────────────────────────────
     def _load_fields(self):
@@ -350,4 +351,5 @@ class App(tk.Tk):
 
 if __name__ == '__main__':
     app = App()
+    sv_ttk.set_theme("light")
     app.mainloop()

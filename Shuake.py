@@ -1,3 +1,6 @@
+import threading
+from enum import Enum
+
 from playwright.async_api import async_playwright
 from getcourseid import Get_course_id
 import asyncio
@@ -10,11 +13,12 @@ MANDATORY_URL = "https://bjce.bjdj.gov.cn/#/course/courseResources?activedIndex=
 MANDATORY_CHANNEL = "zhengzhililun"
 OPTIONAL_URL = "https://bjce.bjdj.gov.cn/#/course/courseResources?activedIndex=4&id=zonghesuzhi"
 OPTIONAL_CHANNEL = "zonghesuzhi"
+HOME_URL = "https://bjce.bjdj.gov.cn/#/"
 
 # 网络波动自愈等待时长（秒）
-RECOVERY_WAIT_SEC = 180
+RECOVERY_WAIT_SEC = 60
 # 登录阶段等待时长（毫秒）
-LOGIN_TIMEOUT_MS = 180000
+LOGIN_TIMEOUT_MS = 60000
 
 
 class NoRemainingCourseError(Exception):
@@ -37,40 +41,66 @@ class Shuake:
         log_cb: 日志回调函数 log_cb(str)，不传则 fallback 到 print
         progress_cb: 学时进度回调 progress_cb(mandatory: float, optional: float)
         """
+        self.page = None
+        self.context = None
+        self.browser = None
         self.user = user
         self.mandatory_target = float(mandatory_target or 0)
         self.optional_target = float(optional_target or 0)
         self._log = log_cb if log_cb else print
         self._progress_cb = progress_cb
-        self._stop = False
+        self._stop_event = threading.Event()
+
+    @property
+    def _stop(self) -> bool:
+        return self._stop_event.is_set()
+
+    def stop(self):
+        self._stop_event.set()
 
     def log(self, msg: str):
         self._log(msg)
 
-    def stop(self):
-        self._stop = True
-
     # ── 主流程 ────────────────────────────────────────────────────────────────
     async def start(self):
-        async with async_playwright() as playwright:
+        playwright = await async_playwright().start()
+        try:
             self.browser = await playwright.chromium.launch(
-                channel='chrome', headless=False, args=['--mute-audio']
+                channel='msedge', headless=False, args=['--mute-audio']
             )
             self.context = await self.browser.new_context()
             self.page = await self.context.new_page()
-
+            await self._goto_with_retry(HOME_URL)
+            await self.login()
+            await self._wait_login_ready(timeout_ms=LOGIN_TIMEOUT_MS)
+            await self._main_loop()
+        finally:
             try:
-                await self._goto_with_retry("https://bjce.bjdj.gov.cn/#/")
-                await self.login()
-                await self._wait_login_ready(timeout_ms=180000)
-                await self._main_loop()
-            finally:
-                try:
+                if self.browser:
                     await self.browser.close()
-                except Exception:
-                    pass
+            except Exception as e1:
+                self.log(f"错误信息{e1}")
+            try:
+                await playwright.stop()
+            except Exception as e2:
+                self.log(f"错误信息{e2}")
+            # 关闭共享 aiohttp session，避免资源泄漏
+            from getcourseid import close_session
+            await close_session()
+
 
     async def _main_loop(self):
+        """
+                循环学习
+                """
+
+        class StudyType(Enum):
+            """
+            宏定义必修和选修两个类别常量
+            """
+            mandatory = "必修"
+            optional = "选修"
+
         """按目标学时在必修/选修之间自动切换，直到两类均达标或用户停止。"""
         current_kind = None  # 记录上一次刷的类型，尽量避免来回跳转
         while not self._stop:
@@ -157,6 +187,11 @@ class Shuake:
         await self.page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
     async def login(self):
+        """
+        登录
+        Returns:
+
+        """
         selected_user = self.user
         self.log(f"正在登录用户：{selected_user['name']}")
 
@@ -218,18 +253,30 @@ class Shuake:
             self._progress_cb(mandatory, optional)
         return mandatory, optional
 
-    # ── 刷课（每次只刷一门后返回，由外层决定切换） ────────────────────────────
+
     async def _get_course_link(self, url: str, channel_id: str):
+        """
+        刷课（每次只刷一门后返回，由外层决定切换）
+        Args:
+            url:
+            channel_id:
+
+        Returns:
+            未完成的课程
+        """
         await self._goto_with_retry(url)
         cookies = await self.context.cookies()
         cookies = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
 
-        container = await self.page.wait_for_selector('div.iv-template-every > ul', timeout=30000)
-        course_items = await container.query_selector_all('li[data-v-d50a91fc]')
-        rowlength = len(course_items)
+        # 等待课程列表容器出现即可，不必先数 DOM
+        try:
+            container = await self.page.wait_for_selector('div.iv-template-every > ul', timeout=30000)
+            course_items = await container.query_selector_all('li[data-v-d50a91fc]')
+            row_length = len(course_items)
+            return await Get_course_id(cookies, channel_id, page_size=row_length, current_page=1)
+        except Exception as e:
+            self.log(f"错误信息{e}.")
 
-        uncompleted_courses = await Get_course_id(cookies, channel_id, rowlength, 1)
-        return uncompleted_courses
 
     async def _run_one_course(self, url: str, channel_id: str):
         """在指定专题页面下刷一门未完成课程；若无剩余课程则抛 NoRemainingCourseError。"""
@@ -272,23 +319,36 @@ class Shuake:
                 if await button.is_visible():
                     await button.click()
                     break
-
             previous_url = self.page.url
             await asyncio.sleep(2)
             all_pages = self.context.pages
-            if len(all_pages) > 1:
+
+            # 检查是否打开新页面
+            # 未打开新页面
+            if len(all_pages) < 2:
+                if self.page.url == previous_url:
+                    self.log("检测到页面 URL 变化，当前仍在原窗口")
+                else:
+                    self.log("未检测到新窗口或 URL 变化，请检查页面逻辑")
+            else:
                 new_page = all_pages[-1]
                 await new_page.wait_for_load_state()
                 self.page = new_page
+                # 1.检查是否存在#iv-aicc-iframe
+                iframe_tag = await self.page.locator('#iv-aicc-iframe').count() # 大于0则说明存在
+                # 2.存在#iv-aicc-iframe
+                if iframe_tag > 0:
+                    frame = self.page.frame_locator('#iv-aicc-iframe')
+                    await frame.get_by_role('button', name='继续学习').click()
                 self.log(f"已切换到新窗口，开始学习《{course_name}》")
-            elif self.page.url != previous_url:
-                self.log("检测到页面 URL 变化，当前仍在原窗口")
-            else:
-                self.log("未检测到新窗口或 URL 变化，请检查页面逻辑")
+            # elif self.page.url != previous_url:
+            #     self.log("检测到页面 URL 变化，当前仍在原窗口")
+            # else:
+            #     self.log("未检测到新窗口或 URL 变化，请检查页面逻辑")
 
-            if set_type == 1:
+            if set_type == 1: # 课程没分节
                 await self._monitor_course_progress(course_name)
-            elif set_type == 3:
+            elif set_type == 3: #课程分节
                 await self._play_series_sections()
 
             await self._close_and_return_to_main_window()
@@ -339,64 +399,126 @@ class Shuake:
 
     async def _play_series_sections(self):
         await self.page.wait_for_load_state('domcontentloaded')
-        completed_sections, uncompleted_sections = await self._fetch_course_sections()
+        _, uncompleted_sections = await self._fetch_course_sections()
 
         while uncompleted_sections and not self._stop:
-            current_section = uncompleted_sections.pop(0)
-            title = current_section["title"]
-            section_element = current_section["element"]
-            await section_element.click()
+            section = uncompleted_sections.pop(0)
+            title = section["title"]
+            await section["element"].click()
             await asyncio.sleep(6)
-            self.log(f"开始学习小节课：{title}")
-            await self._monitor_course_progress(title)
-            completed_sections.append(current_section)
-            self.log(f"完成学习小节课：{title}")
+            self.log(f"开始学习小节：{title}")
+            try:
+                await self._monitor_course_progress(title)
+            except Exception as e:
+                self.log(f"小节《{title}》异常：{e}")
+
+        if self._stop:
+            self.log("系列课程学习被手动停止。")
+            return
 
         self.log("系列课程学习完成！")
         await self._close_and_return_to_main_window()
 
+
     async def _monitor_course_progress(self, course_name):
         self.log("监控播放状态中...")
 
-        total_timeout = 3600
-        start_time = time.time()
-        last_activity_time = start_time
-        activity_interval = 1500
+        TOTAL_TIMEOUT = 3600 # 单节课最长播放时间
+        start_time = time.monotonic()
+        POLL_INTERVAL = 5  # 轮询间隔（秒）
+        last_activity = start_time
+        ACTIVITY_INTERVAL = 1500 # 多久模拟一次鼠标活动
 
-        while time.time() - start_time < total_timeout and not self._stop:
-            is_paused = await self.page.evaluate("document.querySelector('video')?.paused")
-            video_duration = await self.page.evaluate("document.querySelector('video')?.duration")
-            current_time = await self.page.evaluate("document.querySelector('video')?.currentTime")
+        last_pause_click = 0.0
+        PAUSE_CLICK_COOLDOWN = 15
 
-            if is_paused:
-                play_button = await self.page.query_selector("xg-start.xgplayer-start")
-                if play_button:
-                    await play_button.click()
-                    self.log("检测到视频暂停，尝试点击播放按钮...恢复播放成功")
+        while not self._stop:
 
-            progress = await self.page.evaluate(
-                "document.querySelector('video')?.currentTime / document.querySelector('video')?.duration"
-            )
-            if progress and progress >= 0.99:
-                self.log(f"{course_name} 播放完成。")
-                break
+            now = time.monotonic()
 
-            await asyncio.sleep(10)
-
-            if is_paused and video_duration and current_time >= video_duration - 1:
-                self.log(f"{course_name} 播放完成，关闭页面并返回主界面。")
+            if now - start_time >= TOTAL_TIMEOUT:
+                self.log(f"《{course_name}》播放超时，返回主界面。")
                 await self._close_and_return_to_main_window()
-                break
+                return
 
-            if time.time() - last_activity_time >= activity_interval:
+            # 1.检查是否存在#iv-aicc-iframe
+            iframe_tag = await self.page.locator('#iv-aicc-iframe').count()  # 大于0则说明存在
+            # 2.存在#iv-aicc-iframe
+            if iframe_tag > 0:
+                video = self.page.frame_locator("iframe").locator("video")
+                state = await video.evaluate(
+                    """(v) => {
+                        if (!v) return null;
+                        return {
+                            paused: v.paused,
+                            duration: v.duration || 0,
+                            current: v.currentTime || 0,
+                        };
+                    }"""
+                )
+            else:
+                # 一次 evaluate 拿到全部视频状态，避免多次跨进程调用
+                state = await self.page.evaluate(
+                    """() => {
+                        const v = document.querySelector('video');
+                        if (!v) return null;
+                        return {
+                            paused: v.paused,
+                            duration: v.duration || 0,
+                            current: v.currentTime || 0,
+                        };
+                    }"""
+                )
+
+            if state is None:
+                self.log("未检测到视频元素，等待中...")
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            duration = state["duration"] # 完整时长
+            current = state["current"] # 学习时长
+            progress = (current / duration) if duration > 0 else 0
+
+            # 播放完成（两种判定，任一成立即可）
+            if progress >= 0.85 or (duration > 0 and current >= duration - 1):
+                self.log(f"《{course_name}》播放完成。")
+                return
+
+            # 暂停 → 恢复播放，加冷却避免疯狂点
+            # todo iframe
+            if state["paused"] and now - last_pause_click >= PAUSE_CLICK_COOLDOWN:
+                self.log("检测到视频暂停，尝试恢复播放。")
+                try:
+                    if iframe_tag:
+                        frame = self.page.frame_locator("iframe")
+                        btn = await frame.locater("button.jp-play")
+                        if btn and await btn.is_visible():
+                            await btn.click()
+                            last_pause_click = now
+                    else:
+                        btn = await self.page.query_selector("xg-start.xgplayer-start")
+                        if btn and await btn.is_visible():
+                            await btn.click()
+                            last_pause_click = now
+                        else:
+                            btn = await self.page.query_selector("xg-icon.xgplayer-play")
+                            if btn and await btn.is_visible():
+                                await btn.click()
+                                last_pause_click = now
+                except Exception as e:
+                    self.log(f"错误信息{e}")
+                    await self._recover_after_error(e)
+
+            # 模拟用户活动
+            if now - last_activity >= ACTIVITY_INTERVAL:
                 await self._simulate_user_activity()
-                last_activity_time = time.time()
+                last_activity = now
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(POLL_INTERVAL)
 
-        if time.time() - start_time >= total_timeout:
-            self.log("播放超时，尝试重新启动课程。")
-            await self._close_and_return_to_main_window()
+        # 走到这里说明 _stop 被触发
+        self.log(f"《{course_name}》监控被手动停止。")
+
 
     async def _simulate_user_activity(self):
         activity_type = random.choice(["mouse_move", "scroll"])
